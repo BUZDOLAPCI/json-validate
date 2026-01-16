@@ -141,12 +141,4 @@ export function createServer() {
     });
     return server;
 }
-/**
- * Create a standalone server instance for HTTP transport
- * This returns the server without connecting it to any transport,
- * allowing the HTTP transport to manage connections per-session.
- */
-export function createStandaloneServer() {
-    return createServer();
-}
 //# sourceMappingURL=server.js.map

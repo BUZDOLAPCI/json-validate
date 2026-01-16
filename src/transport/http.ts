@@ -1,8 +1,13 @@
 import { createServer as createHttpServer, IncomingMessage, ServerResponse, Server as HttpServer } from 'http';
-import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import type { ServerConfig } from '../types.js';
+import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { createServer } from '../server.js';
 import { randomUUID } from 'crypto';
+
+export interface HttpTransportConfig {
+  port: number;
+  host?: string;
+}
 
 // Store active sessions with their transports
 const sessions = new Map<string, { transport: StreamableHTTPServerTransport; server: Server }>();
@@ -12,8 +17,7 @@ const sessions = new Map<string, { transport: StreamableHTTPServerTransport; ser
  */
 async function handleMcpRequest(
   req: IncomingMessage,
-  res: ServerResponse,
-  mcpServer: Server
+  res: ServerResponse
 ): Promise<void> {
   // Check for existing session
   const sessionId = req.headers['mcp-session-id'] as string | undefined;
@@ -23,11 +27,14 @@ async function handleMcpRequest(
     const session = sessions.get(sessionId)!;
     await session.transport.handleRequest(req, res);
   } else {
-    // New session - create transport
+    // New session - create transport and server
     const newSessionId = randomUUID();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => newSessionId,
     });
+
+    // Create a new MCP server for this session
+    const mcpServer = createServer();
 
     sessions.set(newSessionId, { transport, server: mcpServer });
 
@@ -71,9 +78,10 @@ function handleMethodNotAllowed(res: ServerResponse): void {
 }
 
 /**
- * Create and start HTTP transport for MCP server using StreamableHTTPServerTransport
+ * Start HTTP transport for MCP server using StreamableHTTPServerTransport
  */
-export async function startHttpTransport(server: Server, config: ServerConfig): Promise<void> {
+export async function startHttpTransport(config: HttpTransportConfig): Promise<HttpServer> {
+  const host = config.host ?? '127.0.0.1';
   const httpServer: HttpServer = createHttpServer();
 
   httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
@@ -83,7 +91,7 @@ export async function startHttpTransport(server: Server, config: ServerConfig): 
       switch (url.pathname) {
         case '/mcp':
           if (req.method === 'POST' || req.method === 'GET' || req.method === 'DELETE') {
-            await handleMcpRequest(req, res, server);
+            await handleMcpRequest(req, res);
           } else {
             handleMethodNotAllowed(res);
           }
@@ -107,10 +115,10 @@ export async function startHttpTransport(server: Server, config: ServerConfig): 
     }
   });
 
-  httpServer.listen(config.port, config.host, () => {
-    console.log(`HTTP server listening on http://${config.host}:${config.port}`);
-    console.log(`MCP endpoint: http://${config.host}:${config.port}/mcp`);
-    console.log(`Health check: http://${config.host}:${config.port}/health`);
+  httpServer.listen(config.port, host, () => {
+    console.log(`HTTP server listening on http://${host}:${config.port}`);
+    console.log(`MCP endpoint: http://${host}:${config.port}/mcp`);
+    console.log(`Health check: http://${host}:${config.port}/health`);
   });
 
   // Handle graceful shutdown
@@ -121,14 +129,13 @@ export async function startHttpTransport(server: Server, config: ServerConfig): 
     for (const [sessionId, session] of sessions) {
       try {
         await session.transport.close();
-        console.log(`[${sessionId}] Transport closed`);
+        await session.server.close();
+        console.log(`[${sessionId}] Session closed`);
       } catch {
         // Ignore errors during shutdown
       }
     }
     sessions.clear();
-
-    await server.close();
 
     httpServer.close(() => {
       console.log('HTTP server closed');
@@ -138,4 +145,6 @@ export async function startHttpTransport(server: Server, config: ServerConfig): 
 
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+
+  return httpServer;
 }

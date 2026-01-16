@@ -78,15 +78,6 @@ export interface RepairJsonInput {
     instance_or_text: unknown;
 }
 /**
- * Server configuration
- */
-export interface ServerConfig {
-    transport: 'stdio' | 'http';
-    port: number;
-    host: string;
-    logLevel: 'debug' | 'info' | 'warn' | 'error';
-}
-/**
  * Helper function to create success response
  */
 export declare function createSuccessResponse<T>(data: T, options?: {
