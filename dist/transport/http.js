@@ -1,74 +1,247 @@
-import { createServer as createHttpServer } from 'http';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { createServer } from '../server.js';
-import { randomUUID } from 'crypto';
-// Store active sessions with their transports
-const sessions = new Map();
+import { createServer } from 'http';
+import { validateJson, explainValidation, repairJson } from '../tools/index.js';
 /**
- * Handle MCP protocol requests
+ * MCP Tool definitions for json-validate
  */
-async function handleMcpRequest(req, res) {
-    // Check for existing session
-    const sessionId = req.headers['mcp-session-id'];
-    if (sessionId && sessions.has(sessionId)) {
-        // Existing session - reuse transport
-        const session = sessions.get(sessionId);
-        await session.transport.handleRequest(req, res);
+const toolDefinitions = [
+    {
+        name: 'validate_json',
+        description: 'Validate a JSON instance against a JSON Schema. Returns validation result with detailed errors including paths, keywords, and messages.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                schema: {
+                    type: 'object',
+                    description: 'The JSON Schema to validate against (draft-07 supported)'
+                },
+                instance: {
+                    description: 'The JSON value to validate (can be any JSON type)'
+                }
+            },
+            required: ['schema', 'instance']
+        }
+    },
+    {
+        name: 'explain_validation',
+        description: 'Take validation errors from validate_json and provide human-readable explanations with fix suggestions for each error.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                errors: {
+                    type: 'array',
+                    description: 'Array of validation error objects from validate_json',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            path: { type: 'string' },
+                            keyword: { type: 'string' },
+                            message: { type: 'string' },
+                            params: { type: 'object' },
+                            schemaPath: { type: 'string' }
+                        }
+                    }
+                }
+            },
+            required: ['errors']
+        }
+    },
+    {
+        name: 'repair_json',
+        description: 'Attempt to repair invalid JSON to match a schema. Handles malformed JSON strings, applies schema defaults, removes unknown fields if additionalProperties is false, and coerces types when safe. Conservative: never invents unknown fields unless schema requires defaults.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                schema: {
+                    type: 'object',
+                    description: 'The JSON Schema the repaired JSON should conform to'
+                },
+                instance_or_text: {
+                    description: 'The JSON value or malformed JSON string to repair'
+                }
+            },
+            required: ['schema', 'instance_or_text']
+        }
     }
-    else {
-        // New session - create transport and server
-        const newSessionId = randomUUID();
-        const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => newSessionId,
-        });
-        // Create a new MCP server for this session
-        const mcpServer = createServer();
-        sessions.set(newSessionId, { transport, server: mcpServer });
-        // Handle session close
-        transport.onclose = () => {
-            sessions.delete(newSessionId);
-            console.log(`[${newSessionId}] Session closed`);
+];
+/**
+ * Handle a single JSON-RPC request
+ */
+async function handleJsonRpcRequest(request) {
+    const { id, method, params } = request;
+    try {
+        switch (method) {
+            case 'initialize': {
+                return {
+                    jsonrpc: '2.0',
+                    id,
+                    result: {
+                        protocolVersion: '2024-11-05',
+                        capabilities: {
+                            tools: {},
+                        },
+                        serverInfo: {
+                            name: 'json-validate',
+                            version: '1.0.0',
+                        },
+                    },
+                };
+            }
+            case 'tools/list': {
+                return {
+                    jsonrpc: '2.0',
+                    id,
+                    result: {
+                        tools: toolDefinitions,
+                    },
+                };
+            }
+            case 'tools/call': {
+                const toolName = params?.name;
+                const args = params?.arguments;
+                let result;
+                switch (toolName) {
+                    case 'validate_json': {
+                        const input = args;
+                        result = validateJson(input);
+                        break;
+                    }
+                    case 'explain_validation': {
+                        const input = args;
+                        result = explainValidation(input);
+                        break;
+                    }
+                    case 'repair_json': {
+                        const input = args;
+                        result = repairJson(input);
+                        break;
+                    }
+                    default:
+                        return {
+                            jsonrpc: '2.0',
+                            id,
+                            error: {
+                                code: -32601,
+                                message: `Unknown tool: ${toolName}`,
+                            },
+                        };
+                }
+                return {
+                    jsonrpc: '2.0',
+                    id,
+                    result: {
+                        content: [
+                            {
+                                type: 'text',
+                                text: JSON.stringify(result, null, 2),
+                            },
+                        ],
+                    },
+                };
+            }
+            default:
+                return {
+                    jsonrpc: '2.0',
+                    id,
+                    error: {
+                        code: -32601,
+                        message: `Method not found: ${method}`,
+                    },
+                };
+        }
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        return {
+            jsonrpc: '2.0',
+            id,
+            error: {
+                code: -32603,
+                message: `Internal error: ${message}`,
+            },
         };
-        // Connect the MCP server to this transport
-        await mcpServer.connect(transport);
-        console.log(`[${newSessionId}] New MCP session established`);
-        // Handle the initial request
-        await transport.handleRequest(req, res);
     }
 }
 /**
- * Handle health check requests
+ * Read the request body as a string
+ */
+function readBody(req) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        req.on('data', (chunk) => chunks.push(chunk));
+        req.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+        req.on('error', reject);
+    });
+}
+/**
+ * Send a JSON response
+ */
+function sendJson(res, statusCode, data) {
+    const body = JSON.stringify(data);
+    res.writeHead(statusCode, {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+    });
+    res.end(body);
+}
+/**
+ * Handle health check endpoint
  */
 function handleHealthCheck(res) {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
+    sendJson(res, 200, { status: 'ok', service: 'json-validate' });
 }
 /**
- * Handle 404 Not Found
+ * Handle not found
  */
 function handleNotFound(res) {
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not found' }));
+    sendJson(res, 404, { error: 'Not found' });
 }
 /**
- * Handle 405 Method Not Allowed
+ * Handle method not allowed
  */
 function handleMethodNotAllowed(res) {
-    res.writeHead(405, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Method not allowed' }));
+    sendJson(res, 405, { error: 'Method not allowed' });
 }
 /**
- * Start HTTP transport for MCP server using StreamableHTTPServerTransport
+ * Handle MCP JSON-RPC endpoint
  */
-export async function startHttpTransport(config) {
-    const host = config.host ?? '127.0.0.1';
-    const httpServer = createHttpServer();
+async function handleMcpRequest(req, res) {
+    try {
+        const body = await readBody(req);
+        const request = JSON.parse(body);
+        if (!request.jsonrpc || request.jsonrpc !== '2.0') {
+            sendJson(res, 400, {
+                jsonrpc: '2.0',
+                id: request.id || 0,
+                error: {
+                    code: -32600,
+                    message: 'Invalid Request: missing or invalid jsonrpc version',
+                },
+            });
+            return;
+        }
+        const response = await handleJsonRpcRequest(request);
+        sendJson(res, 200, response);
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        sendJson(res, 500, {
+            ok: false,
+            error: message,
+        });
+    }
+}
+/**
+ * Create and configure the HTTP server
+ */
+export function createHttpServer() {
+    const httpServer = createServer();
     httpServer.on('request', async (req, res) => {
-        const url = new URL(req.url, `http://${req.headers.host}`);
+        const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+        const method = req.method?.toUpperCase();
         try {
             switch (url.pathname) {
                 case '/mcp':
-                    if (req.method === 'POST' || req.method === 'GET' || req.method === 'DELETE') {
+                    if (method === 'POST') {
                         await handleMcpRequest(req, res);
                     }
                     else {
@@ -76,7 +249,7 @@ export async function startHttpTransport(config) {
                     }
                     break;
                 case '/health':
-                    if (req.method === 'GET') {
+                    if (method === 'GET') {
                         handleHealthCheck(res);
                     }
                     else {
@@ -88,31 +261,27 @@ export async function startHttpTransport(config) {
             }
         }
         catch (error) {
-            console.error('Error handling request:', error);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Internal server error' }));
+            console.error('Server error:', error);
+            const message = error instanceof Error ? error.message : 'Internal server error';
+            sendJson(res, 500, { ok: false, error: message });
         }
     });
+    return httpServer;
+}
+/**
+ * Start HTTP transport for MCP server using stateless JSON-RPC handling
+ */
+export async function startHttpTransport(config) {
+    const host = config.host ?? '127.0.0.1';
+    const httpServer = createHttpServer();
     httpServer.listen(config.port, host, () => {
-        console.log(`HTTP server listening on http://${host}:${config.port}`);
+        console.log(`json-validate HTTP server listening on http://${host}:${config.port}`);
         console.log(`MCP endpoint: http://${host}:${config.port}/mcp`);
         console.log(`Health check: http://${host}:${config.port}/health`);
     });
     // Handle graceful shutdown
-    const shutdown = async () => {
+    const shutdown = () => {
         console.log('Shutting down HTTP server...');
-        // Close all sessions
-        for (const [sessionId, session] of sessions) {
-            try {
-                await session.transport.close();
-                await session.server.close();
-                console.log(`[${sessionId}] Session closed`);
-            }
-            catch {
-                // Ignore errors during shutdown
-            }
-        }
-        sessions.clear();
         httpServer.close(() => {
             console.log('HTTP server closed');
             process.exit(0);
