@@ -1,64 +1,115 @@
-import express from 'express';
+import { createServer as createHttpServer, IncomingMessage, ServerResponse, Server as HttpServer } from 'http';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { ServerConfig } from '../types.js';
+import { randomUUID } from 'crypto';
+
+// Store active sessions with their transports
+const sessions = new Map<string, { transport: StreamableHTTPServerTransport; server: Server }>();
 
 /**
- * Create and start HTTP transport for MCP server using SSE
+ * Handle MCP protocol requests
  */
-export async function startHttpTransport(server: Server, config: ServerConfig): Promise<void> {
-  const app = express();
+async function handleMcpRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  mcpServer: Server
+): Promise<void> {
+  // Check for existing session
+  const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
-  // Store active transports for cleanup
-  const transports: Map<string, SSEServerTransport> = new Map();
-
-  // Health check endpoint
-  app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
-  });
-
-  // SSE endpoint for MCP
-  app.get('/sse', async (req, res) => {
-    const sessionId = crypto.randomUUID();
-
-    console.log(`[${sessionId}] New SSE connection established`);
-
-    const transport = new SSEServerTransport('/message', res);
-    transports.set(sessionId, transport);
-
-    // Handle connection close
-    res.on('close', () => {
-      console.log(`[${sessionId}] SSE connection closed`);
-      transports.delete(sessionId);
+  if (sessionId && sessions.has(sessionId)) {
+    // Existing session - reuse transport
+    const session = sessions.get(sessionId)!;
+    await session.transport.handleRequest(req, res);
+  } else {
+    // New session - create transport
+    const newSessionId = randomUUID();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => newSessionId,
     });
 
-    await server.connect(transport);
-  });
+    sessions.set(newSessionId, { transport, server: mcpServer });
 
-  // Message endpoint for client-to-server messages
-  app.post('/message', express.json(), async (req, res) => {
-    // Find the transport that matches (in practice, you'd use session IDs)
-    // For simplicity, we'll broadcast to all transports
-    const messageHandled = false;
+    // Handle session close
+    transport.onclose = () => {
+      sessions.delete(newSessionId);
+      console.log(`[${newSessionId}] Session closed`);
+    };
 
-    for (const transport of transports.values()) {
-      try {
-        await transport.handlePostMessage(req, res);
-        return;
-      } catch {
-        // Try next transport
+    // Connect the MCP server to this transport
+    await mcpServer.connect(transport);
+    console.log(`[${newSessionId}] New MCP session established`);
+
+    // Handle the initial request
+    await transport.handleRequest(req, res);
+  }
+}
+
+/**
+ * Handle health check requests
+ */
+function handleHealthCheck(res: ServerResponse): void {
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
+}
+
+/**
+ * Handle 404 Not Found
+ */
+function handleNotFound(res: ServerResponse): void {
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not found' }));
+}
+
+/**
+ * Handle 405 Method Not Allowed
+ */
+function handleMethodNotAllowed(res: ServerResponse): void {
+  res.writeHead(405, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Method not allowed' }));
+}
+
+/**
+ * Create and start HTTP transport for MCP server using StreamableHTTPServerTransport
+ */
+export async function startHttpTransport(server: Server, config: ServerConfig): Promise<void> {
+  const httpServer: HttpServer = createHttpServer();
+
+  httpServer.on('request', async (req: IncomingMessage, res: ServerResponse) => {
+    const url = new URL(req.url!, `http://${req.headers.host}`);
+
+    try {
+      switch (url.pathname) {
+        case '/mcp':
+          if (req.method === 'POST' || req.method === 'GET' || req.method === 'DELETE') {
+            await handleMcpRequest(req, res, server);
+          } else {
+            handleMethodNotAllowed(res);
+          }
+          break;
+
+        case '/health':
+          if (req.method === 'GET') {
+            handleHealthCheck(res);
+          } else {
+            handleMethodNotAllowed(res);
+          }
+          break;
+
+        default:
+          handleNotFound(res);
       }
-    }
-
-    if (!messageHandled) {
-      res.status(400).json({ error: 'No active transport found' });
+    } catch (error) {
+      console.error('Error handling request:', error);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Internal server error' }));
     }
   });
 
-  // Start the server
-  const httpServer = app.listen(config.port, config.host, () => {
+  httpServer.listen(config.port, config.host, () => {
     console.log(`HTTP server listening on http://${config.host}:${config.port}`);
-    console.log(`SSE endpoint: http://${config.host}:${config.port}/sse`);
+    console.log(`MCP endpoint: http://${config.host}:${config.port}/mcp`);
     console.log(`Health check: http://${config.host}:${config.port}/health`);
   });
 
@@ -66,15 +117,16 @@ export async function startHttpTransport(server: Server, config: ServerConfig): 
   const shutdown = async () => {
     console.log('Shutting down HTTP server...');
 
-    // Close all transports
-    for (const transport of transports.values()) {
+    // Close all sessions
+    for (const [sessionId, session] of sessions) {
       try {
-        // Transports will be cleaned up when connections close
+        await session.transport.close();
+        console.log(`[${sessionId}] Transport closed`);
       } catch {
         // Ignore errors during shutdown
       }
     }
-    transports.clear();
+    sessions.clear();
 
     await server.close();
 
