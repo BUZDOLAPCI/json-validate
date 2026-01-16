@@ -4,8 +4,8 @@ import type { ServerConfig } from './types.js';
  * Default configuration values
  */
 const defaults: ServerConfig = {
-  transport: 'stdio',
-  port: 3000,
+  transport: 'http',
+  port: 8080,
   host: '127.0.0.1',
   logLevel: 'info'
 };

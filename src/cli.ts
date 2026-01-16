@@ -57,8 +57,8 @@ json-validate - MCP server for JSON Schema validation and repair
 Usage: json-validate [options]
 
 Options:
-  -t, --transport <type>  Transport type: 'stdio' or 'http' (default: stdio)
-  -p, --port <number>     HTTP server port (default: 3000)
+  -t, --transport <type>  Transport type: 'stdio' or 'http' (default: http)
+  -p, --port <number>     HTTP server port (default: 8080)
   -H, --host <address>    HTTP server host (default: 127.0.0.1)
   -l, --log-level <level> Log level: 'debug', 'info', 'warn', 'error' (default: info)
   -h, --help              Show this help message
@@ -70,13 +70,13 @@ Environment Variables:
   LOG_LEVEL    Log level
 
 Examples:
-  # Run with STDIO transport (default)
+  # Run with HTTP transport (default, port 8080)
   json-validate
 
-  # Run with HTTP transport on port 8080
-  json-validate --transport http --port 8080
+  # Run with STDIO transport
+  json-validate --transport stdio
 
   # Run with environment variables
-  TRANSPORT=http PORT=3001 json-validate
+  TRANSPORT=stdio json-validate
 `);
 }
