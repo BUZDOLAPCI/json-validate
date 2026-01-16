@@ -2,7 +2,8 @@
 node_modules/
 
 # Build output
-dist/
+# Note: dist/ is tracked for deployment (no build step in Dedalus marketplace)
+# dist/
 
 # Environment files
 .env
